@@ -144,6 +144,66 @@
     (var-set emergency-stop (not (var-get emergency-stop)))
     (ok (var-get emergency-stop))))
 
+;; Advanced rebalancing function with MEV protection and dynamic fee adjustment
+(define-public (advanced-rebalance-with-protection (target-ratio uint) (max-slippage uint) (time-window uint))
+  (let ((current-reserve-x (var-get reserve-x))
+        (current-reserve-y (var-get reserve-y))
+        (current-ratio (/ (* current-reserve-x price-precision) current-reserve-y))
+        (ratio-deviation (if (> current-ratio target-ratio)
+                            (- current-ratio target-ratio)
+                            (- target-ratio current-ratio)))
+        (rebalance-threshold (/ (* target-ratio max-slippage) u10000))
+        (current-volatility (var-get volatility-factor))
+        (anti-mev-delay (if (> current-volatility u500) u10 u5))
+        (dynamic-fee-multiplier (+ u100 (/ current-volatility u10)))
+        (adjusted-fee (if (< (* base-fee dynamic-fee-multiplier) max-fee)
+                         (* base-fee dynamic-fee-multiplier)
+                         max-fee))
+        (total-supply-val (var-get total-supply))
+        (liquidity-depth (+ current-reserve-x current-reserve-y))
+        (rebalance-amount (/ (* ratio-deviation liquidity-depth) (* u2 price-precision)))
+        (fee-revenue (/ (* rebalance-amount adjusted-fee) fee-precision))
+        (net-rebalance-amount (- rebalance-amount fee-revenue))
+        (new-reserve-x (if (> current-ratio target-ratio)
+                          (- current-reserve-x net-rebalance-amount)
+                          (+ current-reserve-x net-rebalance-amount)))
+        (new-reserve-y (if (> current-ratio target-ratio)
+                          (+ current-reserve-y net-rebalance-amount)
+                          (- current-reserve-y net-rebalance-amount)))
+        (k-constant (* current-reserve-x current-reserve-y))
+        (new-k-constant (* new-reserve-x new-reserve-y))
+        (k-invariant-maintained (>= new-k-constant k-constant)))
+    
+    ;; Security checks and validations
+    (asserts! (not (var-get emergency-stop)) err-emergency-stop)
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> ratio-deviation rebalance-threshold) err-pool-imbalanced)
+    (asserts! k-invariant-maintained err-pool-imbalanced)
+    (asserts! (> total-supply-val min-liquidity) err-insufficient-balance)
+    (asserts! (and (> new-reserve-x u0) (> new-reserve-y u0)) err-invalid-amount)
+    
+    ;; Update reserves with protection mechanisms
+    (var-set reserve-x new-reserve-x)
+    (var-set reserve-y new-reserve-y)
+    (var-set fee-adjustment adjusted-fee)
+    
+    ;; Update volatility metrics and price history
+    (let ((new-price (/ (* new-reserve-y price-precision) new-reserve-x)))
+      (update-volatility new-price)
+      (map-set price-history time-window new-price))
+    
+    ;; Return comprehensive rebalancing information
+    (ok {
+      old-ratio: current-ratio,
+      new-ratio: (/ (* new-reserve-x price-precision) new-reserve-y),
+      rebalanced-amount: net-rebalance-amount,
+      fee-collected: fee-revenue,
+      new-reserves: {x: new-reserve-x, y: new-reserve-y},
+      volatility-factor: current-volatility,
+      applied-fee: adjusted-fee,
+      k-constant-maintained: k-invariant-maintained
+    })))
+
 ;; Read-only functions
 (define-read-only (get-reserves) 
   {reserve-x: (var-get reserve-x), reserve-y: (var-get reserve-y)})
